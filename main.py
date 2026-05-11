@@ -1,6 +1,7 @@
 import json
 import os
 import asyncio
+import time
 from dataclasses import dataclass, field, asdict
 from typing import Dict, Optional, Any
 from astrbot.api.event import filter, AstrMessageEvent
@@ -11,7 +12,7 @@ from astrbot.api import FunctionTool
 # ===================== 新数据模型 =====================
 @dataclass
 class BodySchema:
-    """身体方案（如：正常体型、Q版）"""
+    """身体方案"""
     description: str = field(default="无简介")
     fields: Dict[str, str] = field(default_factory=dict)
 
@@ -21,7 +22,7 @@ class BodySchema:
 
 @dataclass
 class Outfit:
-    """衣着方案（如：常服、泳装）"""
+    """衣着方案"""
     description: str = field(default="无简介")
     fields: Dict[str, str] = field(default_factory=dict)
 
@@ -44,10 +45,10 @@ def _get_conversation_id(event: AstrMessageEvent) -> str:
     def _sid_from_event(ev: AstrMessageEvent) -> Optional[str]:
         if ev is None:
             return None
-        if hasattr(ev, "session_id"):
-            sid = getattr(ev, "session_id", None)
-            if sid:
-                return str(sid)
+        # 直接尝试获取 session_id，Pythonic 写法
+        sid = getattr(ev, "session_id", None)
+        if sid:
+            return str(sid)
         if hasattr(ev, "get_session_id"):
             sid = ev.get_session_id()
             if sid:
@@ -58,8 +59,8 @@ def _get_conversation_id(event: AstrMessageEvent) -> str:
 
     sid = _sid_from_event(event)
     if sid:
+        # 清洗：只保留字母、数字、- 和 _
         safe_sid = "".join(c if c.isalnum() or c in "-_" else "_" for c in sid)
-        safe_sid = safe_sid.replace(":", "_")
         logger.debug(f"会话ID: {safe_sid}")
         return safe_sid
     logger.warning("无法获取会话ID，使用固定兜底: default_conversation")
@@ -67,21 +68,56 @@ def _get_conversation_id(event: AstrMessageEvent) -> str:
 
 # ===================== 会话级锁管理器 =====================
 class ConversationLockManager:
-    def __init__(self):
+    def __init__(self, ttl_seconds: int = 300):
         self._locks: Dict[str, asyncio.Lock] = {}
+        self._last_access: Dict[str, float] = {}
         self._global_lock = asyncio.Lock()
+        self.ttl = ttl_seconds
+        # 启动后台清理任务
+        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+
+    async def _cleanup_loop(self):
+        """定期清理过期锁"""
+        while True:
+            await asyncio.sleep(600)  # 每10分钟清理一次
+            async with self._global_lock:
+                now = time.monotonic()
+                to_remove = []
+                for cid, last in list(self._last_access.items()):
+                    if now - last > self.ttl:
+                        lock = self._locks.get(cid)
+                        # 仅在锁未被持有时删除
+                        if lock and not lock.locked():
+                            to_remove.append(cid)
+                for cid in to_remove:
+                    self._locks.pop(cid, None)
+                    self._last_access.pop(cid, None)
+                    logger.debug(f"已清理过期锁: {cid}")
 
     async def get_lock(self, conversation_id: str) -> asyncio.Lock:
         async with self._global_lock:
+            now = time.monotonic()
+            self._last_access[conversation_id] = now
             if conversation_id not in self._locks:
                 self._locks[conversation_id] = asyncio.Lock()
             return self._locks[conversation_id]
 
     async def cleanup(self, conversation_id: str):
+        """立即移除指定会话的锁"""
         async with self._global_lock:
             self._locks.pop(conversation_id, None)
+            self._last_access.pop(conversation_id, None)
 
-_lock_manager = ConversationLockManager()
+    async def close(self):
+        """取消后台清理任务"""
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+
+_lock_manager = ConversationLockManager(ttl_seconds=300)
 
 # ===================== 辅助函数：字段过滤 =====================
 def filter_fields(fields: Dict[str, str], plugin, is_outfit: bool = True) -> Dict[str, str]:
@@ -91,16 +127,16 @@ def filter_fields(fields: Dict[str, str], plugin, is_outfit: bool = True) -> Dic
         return fields
     allowed_str = plugin.config.get("allowed_fields", "")
     allowed = [f.strip() for f in allowed_str.split(",") if f.strip()]
+    # 修复：如果白名单为空，返回空字典，禁止所有字段
     if not allowed:
-        return fields
-    # 衣着和身体共用一个词条白名单
+        return {}
     return {k: v for k, v in fields.items() if k in allowed}
 
 # ===================== LLM工具：身体方案操作 =====================
 @dataclass
 class CreateBodySchemaTool(FunctionTool):
     name: str = "create_body_schema"
-    description: str = "创建/覆盖身体方案（发色、瞳色、身高、胸围等）"
+    description: str = "创建/覆盖身体方案（发色、瞳色、身高、胸围等）。在不存在对应身体方案时才能调用。"
     plugin_instance: "BotAvatarManager" = field(default=None, repr=False)
     parameters: dict = field(default_factory=lambda: {
         "type": "object",
@@ -127,7 +163,7 @@ class CreateBodySchemaTool(FunctionTool):
             if len(avatar.bodies) == 1:
                 avatar.current_body = schema_name
             self.plugin_instance.save_conversation_avatar(avatar)
-            logger.info(f"✅ 身体方案 [{schema_name}] 已保存\n简介：{description}\n词条：{fields}")
+            logger.info(f"身体方案 [{schema_name}] 已保存，简介：{description}")
             return f"✅ 身体方案 [{schema_name}] 已保存\n简介：{description}\n词条：{fields}"
 
 @dataclass
@@ -149,11 +185,11 @@ class SelectBodySchemaTool(FunctionTool):
         async with lock:
             avatar = self.plugin_instance.load_conversation_avatar(conversation_id)
             if not avatar or schema_name not in avatar.bodies:
-                logger.debug(f"❌ 身体方案 [{schema_name}] 不存在")
+                logger.warning(f"身体方案 [{schema_name}] 不存在")
                 return f"❌ 身体方案 [{schema_name}] 不存在"
             avatar.current_body = schema_name
             self.plugin_instance.save_conversation_avatar(avatar)
-            logger.info(f"✅ 当前身体方案已切换为 [{schema_name}]")
+            logger.info(f"当前身体方案已切换为 [{schema_name}]")
             return f"✅ 当前身体方案已切换为 [{schema_name}]"
 
 @dataclass
@@ -179,24 +215,24 @@ class ModifyBodyFieldTool(FunctionTool):
         async with lock:
             avatar = self.plugin_instance.load_conversation_avatar(conversation_id)
             if not avatar or schema_name not in avatar.bodies:
-                logger.debug(f"❌ 身体方案 [{schema_name}] 不存在")
+                logger.warning(f"身体方案 [{schema_name}] 不存在")
                 return f"❌ 身体方案 [{schema_name}] 不存在"
             if field_name == "description":
                 if len(field_value) > 50:
                     field_value = field_value[:47] + "..."
                 avatar.bodies[schema_name].description = field_value
                 self.plugin_instance.save_conversation_avatar(avatar)
-                logger.info(f"✅ 身体方案 [{schema_name}] 简介已更新：{field_value}")
+                logger.info(f"身体方案 [{schema_name}] 简介已更新：{field_value}")
                 return f"✅ 身体方案 [{schema_name}] 简介已更新：{field_value}"
             # 字段过滤
             filtered = {field_name: field_value}
             filtered = filter_fields(filtered, self.plugin_instance, is_outfit=False)
             if field_name not in filtered:
-                logger.debug(f"❌ 词条 [{field_name}] 不在允许列表中，请联系管理员")
+                logger.warning(f"词条 [{field_name}] 不在允许列表中")
                 return f"❌ 词条 [{field_name}] 不在允许列表中，请联系管理员"
             avatar.bodies[schema_name].fields[field_name] = field_value
             self.plugin_instance.save_conversation_avatar(avatar)
-            logger.info(f"✅ 身体词条已修改：{field_name} → {field_value}")
+            logger.info(f"身体词条已修改：{field_name} → {field_value}")
             return f"✅ 身体词条已修改：{field_name} → {field_value}"
 
 @dataclass
@@ -218,21 +254,21 @@ class DeleteBodySchemaTool(FunctionTool):
         async with lock:
             avatar = self.plugin_instance.load_conversation_avatar(conversation_id)
             if not avatar or schema_name not in avatar.bodies:
-                logger.debug(f"❌ 身体方案 [{schema_name}] 不存在")
+                logger.warning(f"身体方案 [{schema_name}] 不存在")
                 return f"❌ 身体方案 [{schema_name}] 不存在"
             if avatar.current_body == schema_name:
-                logger.debug(f"❌ 不能删除当前正在使用的身体方案，请先切换")
+                logger.warning(f"不能删除当前正在使用的身体方案 [{schema_name}]")
                 return f"❌ 不能删除当前正在使用的身体方案，请先切换"
             del avatar.bodies[schema_name]
             self.plugin_instance.save_conversation_avatar(avatar)
-            logger.info(f"✅ 身体方案 [{schema_name}] 已删除")
+            logger.info(f"身体方案 [{schema_name}] 已删除")
             return f"✅ 身体方案 [{schema_name}] 已删除"
 
-# ===================== LLM工具：衣着方案操作（沿用原逻辑但适配新模型） =====================
+# ===================== LLM工具：衣着方案操作 =====================
 @dataclass
 class CreateOutfitTool(FunctionTool):
     name: str = "create_avatar_outfit"
-    description: str = "创建/覆盖衣着方案（上衣、下着、鞋子等）"
+    description: str = "创建/覆盖衣着方案（上衣、下着、鞋子等）。在不存在对应衣着方案时才能调用。"
     plugin_instance: "BotAvatarManager" = field(default=None, repr=False)
     parameters: dict = field(default_factory=lambda: {
         "type": "object",
@@ -259,7 +295,7 @@ class CreateOutfitTool(FunctionTool):
             if len(avatar.outfits) == 1:
                 avatar.current_outfit = outfit_name
             self.plugin_instance.save_conversation_avatar(avatar)
-            logger.info(f"✅ 衣着方案 [{outfit_name}] 已保存\n简介：{description}\n词条：{fields}")
+            logger.info(f"衣着方案 [{outfit_name}] 已保存，简介：{description}")
             return f"✅ 衣着方案 [{outfit_name}] 已保存\n简介：{description}\n词条：{fields}"
 
 @dataclass
@@ -281,11 +317,11 @@ class SelectOutfitTool(FunctionTool):
         async with lock:
             avatar = self.plugin_instance.load_conversation_avatar(conversation_id)
             if not avatar or outfit_name not in avatar.outfits:
-                logger.debug(f"❌ 衣着方案 [{outfit_name}] 不存在")
+                logger.warning(f"衣着方案 [{outfit_name}] 不存在")
                 return f"❌ 衣着方案 [{outfit_name}] 不存在"
             avatar.current_outfit = outfit_name
             self.plugin_instance.save_conversation_avatar(avatar)
-            logger.info(f"✅ 当前衣着已切换为 [{outfit_name}]")
+            logger.info(f"当前衣着已切换为 [{outfit_name}]")
             return f"✅ 当前衣着已切换为 [{outfit_name}]"
 
 @dataclass
@@ -311,23 +347,23 @@ class ModifyOutfitFieldTool(FunctionTool):
         async with lock:
             avatar = self.plugin_instance.load_conversation_avatar(conversation_id)
             if not avatar or outfit_name not in avatar.outfits:
-                logger.debug(f"❌ 衣着方案 [{outfit_name}] 不存在")
+                logger.warning(f"衣着方案 [{outfit_name}] 不存在")
                 return f"❌ 衣着方案 [{outfit_name}] 不存在"
             if field_name == "description":
                 if len(field_value) > 50:
                     field_value = field_value[:47] + "..."
                 avatar.outfits[outfit_name].description = field_value
                 self.plugin_instance.save_conversation_avatar(avatar)
-                logger.info(f"✅ 衣着 [{outfit_name}] 简介已更新：{field_value}")
+                logger.info(f"衣着 [{outfit_name}] 简介已更新：{field_value}")
                 return f"✅ 衣着 [{outfit_name}] 简介已更新：{field_value}"
             filtered = {field_name: field_value}
             filtered = filter_fields(filtered, self.plugin_instance, is_outfit=True)
             if field_name not in filtered:
-                logger.debug(f"❌ 词条 [{field_name}] 不在允许列表中")
+                logger.warning(f"词条 [{field_name}] 不在允许列表中")
                 return f"❌ 词条 [{field_name}] 不在允许列表中"
             avatar.outfits[outfit_name].fields[field_name] = field_value
             self.plugin_instance.save_conversation_avatar(avatar)
-            logger.info(f"✅ 衣着词条已修改：{field_name} → {field_value}")
+            logger.info(f"衣着词条已修改：{field_name} → {field_value}")
             return f"✅ 衣着词条已修改：{field_name} → {field_value}"
 
 @dataclass
@@ -349,14 +385,14 @@ class DeleteOutfitTool(FunctionTool):
         async with lock:
             avatar = self.plugin_instance.load_conversation_avatar(conversation_id)
             if not avatar or outfit_name not in avatar.outfits:
-                logger.debug(f"❌ 衣着方案 [{outfit_name}] 不存在")
+                logger.warning(f"衣着方案 [{outfit_name}] 不存在")
                 return f"❌ 衣着方案 [{outfit_name}] 不存在"
             if avatar.current_outfit == outfit_name:
-                logger.debug(f"❌ 不能删除当前衣着，请先切换")
+                logger.warning(f"不能删除当前衣着 [{outfit_name}]")
                 return f"❌ 不能删除当前衣着，请先切换"
             del avatar.outfits[outfit_name]
             self.plugin_instance.save_conversation_avatar(avatar)
-            logger.info(f"✅ 衣着 [{outfit_name}] 已删除")
+            logger.info(f"衣着 [{outfit_name}] 已删除")
             return f"✅ 衣着 [{outfit_name}] 已删除"
 
 # ===================== 插件主类 =====================
@@ -369,14 +405,12 @@ class BotAvatarManager(Star):
 
         # 注册LLM工具（根据配置动态添加）
         tools = []
-        # 身体相关工具
         if self.config.get("allow_llm_modify_body", False):
             tools.extend([CreateBodySchemaTool(plugin_instance=self),
                           ModifyBodyFieldTool(plugin_instance=self),
                           DeleteBodySchemaTool(plugin_instance=self)])
         if self.config.get("allow_llm_switch_body", True):
             tools.append(SelectBodySchemaTool(plugin_instance=self))
-        # 衣着相关工具
         if self.config.get("allow_llm_modify_outfit", True):
             tools.extend([CreateOutfitTool(plugin_instance=self),
                           ModifyOutfitFieldTool(plugin_instance=self),
@@ -393,20 +427,39 @@ class BotAvatarManager(Star):
         conversation_id = _get_conversation_id(event)
         lock = await _lock_manager.get_lock(conversation_id)
         async with lock:
-            avatar = self.load_conversation_avatar(conversation_id)
-
-            # 无数据则创建默认
-            if not avatar or not avatar.bodies:
+            file_path = self.get_conversation_file_path(conversation_id)
+            # 先判断文件是否存在，防止因加载失败（如备份失败）导致错误覆盖
+            if os.path.exists(file_path):
+                avatar = self.load_conversation_avatar(conversation_id)
+                if avatar is None:
+                    logger.error(f"会话 {conversation_id} 的形象文件损坏且无法恢复，已跳过形象注入")
+                    return
+                # 健康检查：如果加载成功但 bodies 为空，重建默认
+                if not avatar.bodies:
+                    logger.warning(f"会话 {conversation_id} 的形象数据缺少身体方案，重建默认")
+                    avatar = self._create_default_avatar(conversation_id)
+                    self.save_conversation_avatar(avatar)
+            else:
                 avatar = self._create_default_avatar(conversation_id)
                 self.save_conversation_avatar(avatar)
 
             # 修复无效指针
-            if avatar.current_body not in avatar.bodies and avatar.bodies:
-                avatar.current_body = next(iter(avatar.bodies.keys()))
-                self.save_conversation_avatar(avatar)
-            if avatar.current_outfit not in avatar.outfits and avatar.outfits:
-                avatar.current_outfit = next(iter(avatar.outfits.keys()))
-                self.save_conversation_avatar(avatar)
+            if avatar.current_body not in avatar.bodies:
+                if avatar.bodies:
+                    avatar.current_body = next(iter(avatar.bodies.keys()))
+                    self.save_conversation_avatar(avatar)
+                else:
+                    # 极端情况：bodies 被清空，重建默认
+                    avatar = self._create_default_avatar(conversation_id)
+                    self.save_conversation_avatar(avatar)
+            if avatar.current_outfit not in avatar.outfits:
+                if avatar.outfits:
+                    avatar.current_outfit = next(iter(avatar.outfits.keys()))
+                    self.save_conversation_avatar(avatar)
+                else:
+                    # outfits 为空，同样重建默认
+                    avatar = self._create_default_avatar(conversation_id)
+                    self.save_conversation_avatar(avatar)
 
             # 构建上下文文本
             context_text = ""
@@ -461,7 +514,8 @@ class BotAvatarManager(Star):
             else:
                 req.system_prompt += context_text
 
-            logger.debug(f"会话 {conversation_id} 形象已注入")
+            logger.info(f"会话 {conversation_id} 形象已注入")
+            logger.debug(f"形象字段：\n{context_text}")
 
     def _create_default_avatar(self, conversation_id: str) -> ConversationAvatar:
         """创建包含默认身体和两套衣着的形象"""
@@ -505,7 +559,6 @@ class BotAvatarManager(Star):
             outfits={"常服": normal_outfit, "居家服": home_outfit}
         )
 
-    # --------------------- 数据读写（兼容旧版迁移） ---------------------
     def get_conversation_file_path(self, conversation_id: str) -> str:
         return str(self.data_dir / f"{conversation_id}.json")
 
@@ -517,7 +570,7 @@ class BotAvatarManager(Star):
             with open(file_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
-            # 旧数据迁移（无bodies字段）
+            # 旧数据迁移
             if "bodies" not in data:
                 logger.info(f"迁移旧数据：{conversation_id}")
                 # 旧outfits可能是list或dict
@@ -537,8 +590,8 @@ class BotAvatarManager(Star):
                             fields=od.get("fields", {})
                         )
                     current_outfit = data.get("current_outfit", "常服")
-                # 创建默认身体
-                default_body = BodySchema(
+                    # 创建默认身体
+                    default_body = BodySchema(
                     description="标准体型，蓝色长发，金色瞳孔，佩戴星星发饰",
                     fields={"发色": "蓝色长发", "瞳色": "金色", "发饰": "星星发饰", "身高": "165cm", "胸围": "B cup"}
                 )
@@ -578,8 +631,8 @@ class BotAvatarManager(Star):
                 backup = f"{file_path}.bak.{os.urandom(4).hex()}"
                 os.rename(file_path, backup)
                 logger.warning(f"损坏文件已备份至 {backup}")
-            except Exception:
-                pass
+            except Exception as be:
+                logger.error(f"备份损坏文件失败: {be}")
             return None
 
     def save_conversation_avatar(self, avatar: ConversationAvatar):
@@ -595,9 +648,9 @@ class BotAvatarManager(Star):
             with open(file_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            logger.error(f"保存失败: {e}")
+            logger.error(f"保存形象数据失败: {e}")
 
-    # --------------------- 管理员指令（部分保留并适配） ---------------------
+    # --------------------- 管理员指令 ---------------------
     @filter.command("查看bot形象")
     async def view_avatar(self, event: AstrMessageEvent):
         conversation_id = _get_conversation_id(event)
@@ -682,4 +735,5 @@ class BotAvatarManager(Star):
             yield event.plain_result("❌ 当前会话无形象数据")
 
     async def terminate(self):
+        await _lock_manager.close()
         logger.info("BotAvatarManager 已卸载")
