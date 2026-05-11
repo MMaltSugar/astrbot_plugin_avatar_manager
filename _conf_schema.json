@@ -3,26 +3,84 @@
     "description": "形象数据插入LLM上下文的位置",
     "type": "string",
     "default": "system_prompt_end",
-    "hint": "可选值：system_prompt_start(系统提示开头)、system_prompt_end(系统提示结尾)、user_prompt_start(用户提示开头)、user_prompt_end(用户提示结尾)",
-    "obvious_hint": true,
+    "hint": "插入位置",
     "options": [
-        "usystem_prompt_start",
-        "system_prompt_end",
-        "user_prompt_start",
-        "user_prompt_end"
+      "system_prompt_start",
+      "system_prompt_end",
+      "user_prompt_start",
+      "user_prompt_end"
     ]
   },
-  "avatar_fields": {
-    "description": "Bot形象词条列表（逗号分隔）",
+  "body_prefix_prompt": {
+    "description": "身体数据前置提示词（插入LLM上下文前）",
     "type": "string",
-    "default": "发色,瞳色,脸型,体型,胸型,上衣,下着,鞋子,袜子,发型,身高,性格",
-    "hint": "可自定义增删词条，如：发色,瞳色,体型,胸型,上衣,下着,鞋履,配饰",
-    "obvious_hint": true
+    "default": "【你当前的身体形象（必须严格遵守）】",
+    "hint": "可自定义修改"
   },
-  "allow_custom_fields": {
-    "description": "是否允许LLM创建自定义词条",
+  "body_suffix_prompt": {
+    "description": "身体数据后置提示词",
+    "type": "string",
+    "default": "【身体形象设定结束】",
+    "hint": "可自定义修改"
+  },
+  "outfit_prefix_prompt": {
+    "description": "衣着数据前置提示词",
+    "type": "string",
+    "default": "【你当前的衣着形象（必须严格遵守）】",
+    "hint": "可自定义修改"
+  },
+  "outfit_suffix_prompt": {
+    "description": "衣着数据后置提示词",
+    "type": "string",
+    "default": "【衣着形象设定结束】",
+    "hint": "可自定义修改"
+  },
+  "available_outfit_list_prefix": {
+    "description": "可用衣着列表前置提示词",
+    "type": "string",
+    "default": "\n【可用衣着列表（可自主切换）】",
+    "hint": "可自定义修改"
+  },
+  "available_outfit_list_suffix": {
+    "description": "可用衣着列表后置提示词",
+    "type": "string",
+    "default": "【可用衣着列表结束】",
+    "hint": "可自定义修改"
+  },
+  "allow_llm_modify_body": {
+    "description": "是否允许LLM修改/新建身体方案（发色、瞳色等）",
+    "type": "bool",
+    "default": false,
+    "hint": "关闭后LLM无法更改身体数据"
+  },
+  "allow_llm_switch_body": {
+    "description": "是否允许LLM切换身体方案",
     "type": "bool",
     "default": true,
-    "hint": "开启后LLM可创建配置外的词条"
+    "hint": "仅当存在多个身体方案时有效"
+  },
+  "allow_llm_modify_outfit": {
+    "description": "是否允许LLM修改/新建衣着方案",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后LLM无法更改穿着"
+  },
+  "allow_llm_switch_outfit": {
+    "description": "是否允许LLM切换衣着方案",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后LLM只能使用当前衣着"
+  },
+  "allow_custom_fields": {
+    "description": "是否允许LLM自行增添词条（身体和衣着共用）",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后只能使用下方指定的词条"
+  },
+  "allowed_fields": {
+    "description": "当不允许自行增添词条时，此处指定可用的词条名（逗号分隔）",
+    "type": "string",
+    "default": "发色,瞳色,发饰,身高,胸围,上衣,下着,袜子,鞋子,内衣,内裤",
+    "hint": "示例：发色,瞳色,上衣,下着"
   }
 }

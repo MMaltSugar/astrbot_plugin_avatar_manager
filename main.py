@@ -2,15 +2,26 @@ import json
 import os
 import asyncio
 from dataclasses import dataclass, field, asdict
-from typing import Dict, Optional, Any, cast
+from typing import Dict, Optional, Any
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api import FunctionTool
 
-# ===================== 数据模型 =====================
+# ===================== 新数据模型 =====================
 @dataclass
-class AvatarOutfit:
+class BodySchema:
+    """身体方案（如：正常体型、Q版）"""
+    description: str = field(default="无简介")
+    fields: Dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self):
+        if len(self.description) > 50:
+            self.description = self.description[:47] + "..."
+
+@dataclass
+class Outfit:
+    """衣着方案（如：常服、泳装）"""
     description: str = field(default="无简介")
     fields: Dict[str, str] = field(default_factory=dict)
 
@@ -20,196 +31,333 @@ class AvatarOutfit:
 
 @dataclass
 class ConversationAvatar:
+    """对话级完整形象数据"""
     conversation_id: str
+    current_body: str = "默认身体"
+    bodies: Dict[str, BodySchema] = field(default_factory=dict)
     current_outfit: str = "常服"
-    outfits: Dict[str, AvatarOutfit] = field(default_factory=dict)
+    outfits: Dict[str, Outfit] = field(default_factory=dict)
 
-# ===================== 会话ID获取（稳定兜底） =====================
+# ===================== 会话ID获取 =====================
 def _get_conversation_id(event: AstrMessageEvent) -> str:
-    """获取会话唯一ID，取不到时使用固定兜底值，避免数据漂移"""
+    """获取稳定会话ID，失败时使用固定兜底"""
     def _sid_from_event(ev: AstrMessageEvent) -> Optional[str]:
         if ev is None:
             return None
         if hasattr(ev, "session_id"):
             sid = getattr(ev, "session_id", None)
-            if sid is not None:
+            if sid:
                 return str(sid)
         if hasattr(ev, "get_session_id"):
             sid = ev.get_session_id()
-            if sid is not None:
+            if sid:
                 return str(sid)
-        if hasattr(ev, "message_obj"):
-            mobj = getattr(ev, "message_obj", None)
-            if mobj and hasattr(mobj, "session_id"):
-                return str(getattr(mobj, "session_id"))
-        if hasattr(ev, "unified_msg_origin"):
-            umo = getattr(ev, "unified_msg_origin", None)
-            if umo:
-                return str(umo)
+        if hasattr(ev, "message_obj") and hasattr(ev.message_obj, "session_id"):
+            return str(ev.message_obj.session_id)
         return None
 
     sid = _sid_from_event(event)
     if sid:
-        # 清理非法文件名字符，Windows下不允许 : \ / * ? " < > |
         safe_sid = "".join(c if c.isalnum() or c in "-_" else "_" for c in sid)
-        # 额外处理冒号（常见于某些会话ID）
         safe_sid = safe_sid.replace(":", "_")
-        logger.debug(f"获取到会话ID: {safe_sid}")
+        logger.debug(f"会话ID: {safe_sid}")
         return safe_sid
-
-    logger.warning("无法获取会话ID，使用固定兜底ID: default_conversation")
+    logger.warning("无法获取会话ID，使用固定兜底: default_conversation")
     return "default_conversation"
 
-# ===================== 会话级异步锁管理 =====================
+# ===================== 会话级锁管理器 =====================
 class ConversationLockManager:
     def __init__(self):
         self._locks: Dict[str, asyncio.Lock] = {}
-        self._lock = asyncio.Lock()
+        self._global_lock = asyncio.Lock()
 
     async def get_lock(self, conversation_id: str) -> asyncio.Lock:
-        async with self._lock:
+        async with self._global_lock:
             if conversation_id not in self._locks:
                 self._locks[conversation_id] = asyncio.Lock()
             return self._locks[conversation_id]
 
     async def cleanup(self, conversation_id: str):
-        async with self._lock:
+        async with self._global_lock:
             self._locks.pop(conversation_id, None)
 
-# 全局锁管理器实例（在插件中持有）
 _lock_manager = ConversationLockManager()
 
-# ===================== LLM工具定义 =====================
+# ===================== 辅助函数：字段过滤 =====================
+def filter_fields(fields: Dict[str, str], plugin, is_outfit: bool = True) -> Dict[str, str]:
+    """根据配置过滤不允许的字段"""
+    allow_custom = plugin.config.get("allow_custom_fields", True)
+    if allow_custom:
+        return fields
+    allowed_str = plugin.config.get("allowed_fields", "")
+    allowed = [f.strip() for f in allowed_str.split(",") if f.strip()]
+    if not allowed:
+        return fields
+    # 衣着和身体共用一个词条白名单
+    return {k: v for k, v in fields.items() if k in allowed}
+
+# ===================== LLM工具：身体方案操作 =====================
 @dataclass
-class CreateAvatarOutfitTool(FunctionTool):
-    name: str = "create_avatar_outfit"
-    description: str = "创建/覆盖形象列表中的指定着装，支持自定义词条和简介。【规则】：修改4条及以上词条，直接调用本工具覆写对应着装"
+class CreateBodySchemaTool(FunctionTool):
+    name: str = "create_body_schema"
+    description: str = "创建/覆盖身体方案（发色、瞳色、身高、胸围等）"
     plugin_instance: "BotAvatarManager" = field(default=None, repr=False)
     parameters: dict = field(default_factory=lambda: {
         "type": "object",
         "properties": {
-            "outfit_name": {"type": "string", "description": "着装名称"},
-            "description": {"type": "string", "description": "50字内的着装简介"},
-            "fields": {"type": "object", "description": "形象词条键值对"},
+            "schema_name": {"type": "string", "description": "身体方案名称，如「正常体型」"},
+            "description": {"type": "string", "description": "50字内简介"},
+            "fields": {"type": "object", "description": "身体词条，如：{\"发色\":\"蓝色长发\",\"瞳色\":\"金色\"}"}
         },
-        "required": ["outfit_name", "fields"],
+        "required": ["schema_name", "fields"]
     })
 
-    async def run(self, event: AstrMessageEvent, outfit_name: str, fields: Dict[str, str], description: str = "无简介"):
+    async def run(self, event: AstrMessageEvent, schema_name: str, fields: Dict[str, str], description: str = "无简介"):
+        if not self.plugin_instance.config.get("allow_llm_modify_body", False):
+            return "❌ 管理员已禁止LLM修改身体数据"
         conversation_id = _get_conversation_id(event)
         lock = await _lock_manager.get_lock(conversation_id)
         async with lock:
-            # 安全读取配置
-            avatar_fields_str = self.plugin_instance.config.get("avatar_fields", "")
-            config_fields = [f.strip() for f in avatar_fields_str.split(",") if f.strip()]
-            allow_custom = self.plugin_instance.config.get("allow_custom_fields", True)
-            if not allow_custom and config_fields:
-                fields = {k: v for k, v in fields.items() if k in config_fields}
-
-            outfit = AvatarOutfit(description=description, fields=fields)
-            self.plugin_instance.save_outfit_to_list(conversation_id, outfit_name, outfit)
-
-            # 首次创建自动设为当前形象（当只有这一套时）
-            avatar_data = self.plugin_instance.load_conversation_avatar(conversation_id)
-            if avatar_data and len(avatar_data.outfits) == 1:
-                avatar_data.current_outfit = outfit_name
-                self.plugin_instance.save_conversation_avatar(avatar_data)
-
-            return f"✅ 成功创建/覆盖[{outfit_name}]\n简介：{outfit.description}\n形象词条：{fields}"
+            fields = filter_fields(fields, self.plugin_instance, is_outfit=False)
+            body_schema = BodySchema(description=description, fields=fields)
+            avatar = self.plugin_instance.load_conversation_avatar(conversation_id)
+            if not avatar:
+                avatar = ConversationAvatar(conversation_id=conversation_id)
+            avatar.bodies[schema_name] = body_schema
+            if len(avatar.bodies) == 1:
+                avatar.current_body = schema_name
+            self.plugin_instance.save_conversation_avatar(avatar)
+            logger.info(f"✅ 身体方案 [{schema_name}] 已保存\n简介：{description}\n词条：{fields}")
+            return f"✅ 身体方案 [{schema_name}] 已保存\n简介：{description}\n词条：{fields}"
 
 @dataclass
-class SelectAvatarOutfitTool(FunctionTool):
-    name: str = "select_avatar_outfit"
-    description: str = "切换当前形象"
+class SelectBodySchemaTool(FunctionTool):
+    name: str = "select_body_schema"
+    description: str = "切换当前使用的身体方案"
     plugin_instance: "BotAvatarManager" = field(default=None, repr=False)
     parameters: dict = field(default_factory=lambda: {
         "type": "object",
-        "properties": {"outfit_name": {"type": "string", "description": "要切换的着装名称"}},
-        "required": ["outfit_name"],
+        "properties": {"schema_name": {"type": "string", "description": "身体方案名称"}},
+        "required": ["schema_name"]
     })
 
-    async def run(self, event: AstrMessageEvent, outfit_name: str):
+    async def run(self, event: AstrMessageEvent, schema_name: str):
+        if not self.plugin_instance.config.get("allow_llm_switch_body", True):
+            return "❌ 管理员已禁止LLM切换身体方案"
         conversation_id = _get_conversation_id(event)
         lock = await _lock_manager.get_lock(conversation_id)
         async with lock:
-            avatar_data = self.plugin_instance.load_conversation_avatar(conversation_id)
-            if not avatar_data:
-                return f"❌ 当前会话无形象数据"
-            if outfit_name not in avatar_data.outfits:
-                return f"❌ 形象列表中无[{outfit_name}]，可用：{list(avatar_data.outfits.keys())}"
-
-            avatar_data.current_outfit = outfit_name
-            self.plugin_instance.save_conversation_avatar(avatar_data)
-            current = avatar_data.outfits[outfit_name]
-            return f"✅ 切换当前形象为[{outfit_name}]\n简介：{current.description}\n词条：{current.fields}"
+            avatar = self.plugin_instance.load_conversation_avatar(conversation_id)
+            if not avatar or schema_name not in avatar.bodies:
+                logger.debug(f"❌ 身体方案 [{schema_name}] 不存在")
+                return f"❌ 身体方案 [{schema_name}] 不存在"
+            avatar.current_body = schema_name
+            self.plugin_instance.save_conversation_avatar(avatar)
+            logger.info(f"✅ 当前身体方案已切换为 [{schema_name}]")
+            return f"✅ 当前身体方案已切换为 [{schema_name}]"
 
 @dataclass
-class ModifyAvatarFieldTool(FunctionTool):
-    name: str = "modify_avatar_field"
-    description: str = "修改指定着装的单个词条或简介。仅用于1-3条修改，批量请用create_avatar_outfit"
+class ModifyBodyFieldTool(FunctionTool):
+    name: str = "modify_body_field"
+    description: str = "修改身体方案的单个词条或简介（仅1-3条修改）"
     plugin_instance: "BotAvatarManager" = field(default=None, repr=False)
     parameters: dict = field(default_factory=lambda: {
         "type": "object",
         "properties": {
-            "outfit_name": {"type": "string", "description": "着装名称"},
-            "field_name": {"type": "string", "description": "词条名，修改简介填「description」"},
-            "field_value": {"type": "string", "description": "新值（简介限50字）"},
+            "schema_name": {"type": "string", "description": "身体方案名称"},
+            "field_name": {"type": "string", "description": "词条名或description"},
+            "field_value": {"type": "string", "description": "新值"}
         },
-        "required": ["outfit_name", "field_name", "field_value"],
+        "required": ["schema_name", "field_name", "field_value"]
     })
 
-    async def run(self, event: AstrMessageEvent, outfit_name: str, field_name: str, field_value: str):
+    async def run(self, event: AstrMessageEvent, schema_name: str, field_name: str, field_value: str):
+        if not self.plugin_instance.config.get("allow_llm_modify_body", False):
+            return "❌ 管理员已禁止LLM修改身体数据"
         conversation_id = _get_conversation_id(event)
         lock = await _lock_manager.get_lock(conversation_id)
         async with lock:
-            avatar_data = self.plugin_instance.load_conversation_avatar(conversation_id)
-            if not avatar_data or outfit_name not in avatar_data.outfits:
-                return f"❌ 形象[{outfit_name}]不存在"
-
-            # 修改简介
+            avatar = self.plugin_instance.load_conversation_avatar(conversation_id)
+            if not avatar or schema_name not in avatar.bodies:
+                logger.debug(f"❌ 身体方案 [{schema_name}] 不存在")
+                return f"❌ 身体方案 [{schema_name}] 不存在"
             if field_name == "description":
                 if len(field_value) > 50:
                     field_value = field_value[:47] + "..."
-                avatar_data.outfits[outfit_name].description = field_value
-                self.plugin_instance.save_conversation_avatar(avatar_data)
-                return f"✅ 修改简介成功：{field_value}"
-
-            # 修改词条：检查自定义字段权限
-            allow_custom = self.plugin_instance.config.get("allow_custom_fields", True)
-            if not allow_custom:
-                avatar_fields_str = self.plugin_instance.config.get("avatar_fields", "")
-                allowed_fields = [f.strip() for f in avatar_fields_str.split(",") if f.strip()]
-                if field_name not in allowed_fields:
-                    return f"❌ 不允许创建自定义词条「{field_name}」，请在配置中开启或使用已有词条：{allowed_fields}"
-
-            avatar_data.outfits[outfit_name].fields[field_name] = field_value
-            self.plugin_instance.save_conversation_avatar(avatar_data)
-            return f"✅ 修改词条成功：{field_name} → {field_value}"
+                avatar.bodies[schema_name].description = field_value
+                self.plugin_instance.save_conversation_avatar(avatar)
+                logger.info(f"✅ 身体方案 [{schema_name}] 简介已更新：{field_value}")
+                return f"✅ 身体方案 [{schema_name}] 简介已更新：{field_value}"
+            # 字段过滤
+            filtered = {field_name: field_value}
+            filtered = filter_fields(filtered, self.plugin_instance, is_outfit=False)
+            if field_name not in filtered:
+                logger.debug(f"❌ 词条 [{field_name}] 不在允许列表中，请联系管理员")
+                return f"❌ 词条 [{field_name}] 不在允许列表中，请联系管理员"
+            avatar.bodies[schema_name].fields[field_name] = field_value
+            self.plugin_instance.save_conversation_avatar(avatar)
+            logger.info(f"✅ 身体词条已修改：{field_name} → {field_value}")
+            return f"✅ 身体词条已修改：{field_name} → {field_value}"
 
 @dataclass
-class DeleteAvatarOutfitTool(FunctionTool):
-    name: str = "delete_avatar_outfit"
-    description: str = "从形象列表中删除指定着装，不能删除当前使用的形象"
+class DeleteBodySchemaTool(FunctionTool):
+    name: str = "delete_body_schema"
+    description: str = "删除身体方案（不能删除当前使用的）"
     plugin_instance: "BotAvatarManager" = field(default=None, repr=False)
     parameters: dict = field(default_factory=lambda: {
         "type": "object",
-        "properties": {"outfit_name": {"type": "string", "description": "要删除的着装名称"}},
-        "required": ["outfit_name"],
+        "properties": {"schema_name": {"type": "string", "description": "身体方案名称"}},
+        "required": ["schema_name"]
     })
 
-    async def run(self, event: AstrMessageEvent, outfit_name: str):
+    async def run(self, event: AstrMessageEvent, schema_name: str):
+        if not self.plugin_instance.config.get("allow_llm_modify_body", False):
+            return "❌ 管理员已禁止LLM修改身体数据"
         conversation_id = _get_conversation_id(event)
         lock = await _lock_manager.get_lock(conversation_id)
         async with lock:
-            avatar_data = self.plugin_instance.load_conversation_avatar(conversation_id)
-            if not avatar_data or outfit_name not in avatar_data.outfits:
-                return f"❌ 形象[{outfit_name}]不存在"
-            if avatar_data.current_outfit == outfit_name:
-                return f"❌ 无法删除当前使用的形象[{outfit_name}]，请先切换"
+            avatar = self.plugin_instance.load_conversation_avatar(conversation_id)
+            if not avatar or schema_name not in avatar.bodies:
+                logger.debug(f"❌ 身体方案 [{schema_name}] 不存在")
+                return f"❌ 身体方案 [{schema_name}] 不存在"
+            if avatar.current_body == schema_name:
+                logger.debug(f"❌ 不能删除当前正在使用的身体方案，请先切换")
+                return f"❌ 不能删除当前正在使用的身体方案，请先切换"
+            del avatar.bodies[schema_name]
+            self.plugin_instance.save_conversation_avatar(avatar)
+            logger.info(f"✅ 身体方案 [{schema_name}] 已删除")
+            return f"✅ 身体方案 [{schema_name}] 已删除"
 
-            del avatar_data.outfits[outfit_name]
-            self.plugin_instance.save_conversation_avatar(avatar_data)
-            return f"✅ 删除[{outfit_name}]成功，剩余形象：{list(avatar_data.outfits.keys())}"
+# ===================== LLM工具：衣着方案操作（沿用原逻辑但适配新模型） =====================
+@dataclass
+class CreateOutfitTool(FunctionTool):
+    name: str = "create_avatar_outfit"
+    description: str = "创建/覆盖衣着方案（上衣、下着、鞋子等）"
+    plugin_instance: "BotAvatarManager" = field(default=None, repr=False)
+    parameters: dict = field(default_factory=lambda: {
+        "type": "object",
+        "properties": {
+            "outfit_name": {"type": "string", "description": "衣着名称"},
+            "description": {"type": "string", "description": "50字内简介"},
+            "fields": {"type": "object", "description": "衣着词条"}
+        },
+        "required": ["outfit_name", "fields"]
+    })
+
+    async def run(self, event: AstrMessageEvent, outfit_name: str, fields: Dict[str, str], description: str = "无简介"):
+        if not self.plugin_instance.config.get("allow_llm_modify_outfit", True):
+            return "❌ 管理员已禁止LLM修改衣着数据"
+        conversation_id = _get_conversation_id(event)
+        lock = await _lock_manager.get_lock(conversation_id)
+        async with lock:
+            fields = filter_fields(fields, self.plugin_instance, is_outfit=True)
+            outfit = Outfit(description=description, fields=fields)
+            avatar = self.plugin_instance.load_conversation_avatar(conversation_id)
+            if not avatar:
+                avatar = ConversationAvatar(conversation_id=conversation_id)
+            avatar.outfits[outfit_name] = outfit
+            if len(avatar.outfits) == 1:
+                avatar.current_outfit = outfit_name
+            self.plugin_instance.save_conversation_avatar(avatar)
+            logger.info(f"✅ 衣着方案 [{outfit_name}] 已保存\n简介：{description}\n词条：{fields}")
+            return f"✅ 衣着方案 [{outfit_name}] 已保存\n简介：{description}\n词条：{fields}"
+
+@dataclass
+class SelectOutfitTool(FunctionTool):
+    name: str = "select_avatar_outfit"
+    description: str = "切换当前衣着方案"
+    plugin_instance: "BotAvatarManager" = field(default=None, repr=False)
+    parameters: dict = field(default_factory=lambda: {
+        "type": "object",
+        "properties": {"outfit_name": {"type": "string", "description": "衣着名称"}},
+        "required": ["outfit_name"]
+    })
+
+    async def run(self, event: AstrMessageEvent, outfit_name: str):
+        if not self.plugin_instance.config.get("allow_llm_switch_outfit", True):
+            return "❌ 管理员已禁止LLM切换衣着方案"
+        conversation_id = _get_conversation_id(event)
+        lock = await _lock_manager.get_lock(conversation_id)
+        async with lock:
+            avatar = self.plugin_instance.load_conversation_avatar(conversation_id)
+            if not avatar or outfit_name not in avatar.outfits:
+                logger.debug(f"❌ 衣着方案 [{outfit_name}] 不存在")
+                return f"❌ 衣着方案 [{outfit_name}] 不存在"
+            avatar.current_outfit = outfit_name
+            self.plugin_instance.save_conversation_avatar(avatar)
+            logger.info(f"✅ 当前衣着已切换为 [{outfit_name}]")
+            return f"✅ 当前衣着已切换为 [{outfit_name}]"
+
+@dataclass
+class ModifyOutfitFieldTool(FunctionTool):
+    name: str = "modify_avatar_field"
+    description: str = "修改衣着方案的单个词条或简介（1-3条）"
+    plugin_instance: "BotAvatarManager" = field(default=None, repr=False)
+    parameters: dict = field(default_factory=lambda: {
+        "type": "object",
+        "properties": {
+            "outfit_name": {"type": "string", "description": "衣着名称"},
+            "field_name": {"type": "string", "description": "词条名或description"},
+            "field_value": {"type": "string", "description": "新值"}
+        },
+        "required": ["outfit_name", "field_name", "field_value"]
+    })
+
+    async def run(self, event: AstrMessageEvent, outfit_name: str, field_name: str, field_value: str):
+        if not self.plugin_instance.config.get("allow_llm_modify_outfit", True):
+            return "❌ 管理员已禁止LLM修改衣着数据"
+        conversation_id = _get_conversation_id(event)
+        lock = await _lock_manager.get_lock(conversation_id)
+        async with lock:
+            avatar = self.plugin_instance.load_conversation_avatar(conversation_id)
+            if not avatar or outfit_name not in avatar.outfits:
+                logger.debug(f"❌ 衣着方案 [{outfit_name}] 不存在")
+                return f"❌ 衣着方案 [{outfit_name}] 不存在"
+            if field_name == "description":
+                if len(field_value) > 50:
+                    field_value = field_value[:47] + "..."
+                avatar.outfits[outfit_name].description = field_value
+                self.plugin_instance.save_conversation_avatar(avatar)
+                logger.info(f"✅ 衣着 [{outfit_name}] 简介已更新：{field_value}")
+                return f"✅ 衣着 [{outfit_name}] 简介已更新：{field_value}"
+            filtered = {field_name: field_value}
+            filtered = filter_fields(filtered, self.plugin_instance, is_outfit=True)
+            if field_name not in filtered:
+                logger.debug(f"❌ 词条 [{field_name}] 不在允许列表中")
+                return f"❌ 词条 [{field_name}] 不在允许列表中"
+            avatar.outfits[outfit_name].fields[field_name] = field_value
+            self.plugin_instance.save_conversation_avatar(avatar)
+            logger.info(f"✅ 衣着词条已修改：{field_name} → {field_value}")
+            return f"✅ 衣着词条已修改：{field_name} → {field_value}"
+
+@dataclass
+class DeleteOutfitTool(FunctionTool):
+    name: str = "delete_avatar_outfit"
+    description: str = "删除衣着方案（不能删除当前使用的）"
+    plugin_instance: "BotAvatarManager" = field(default=None, repr=False)
+    parameters: dict = field(default_factory=lambda: {
+        "type": "object",
+        "properties": {"outfit_name": {"type": "string", "description": "衣着名称"}},
+        "required": ["outfit_name"]
+    })
+
+    async def run(self, event: AstrMessageEvent, outfit_name: str):
+        if not self.plugin_instance.config.get("allow_llm_modify_outfit", True):
+            return "❌ 管理员已禁止LLM修改衣着数据"
+        conversation_id = _get_conversation_id(event)
+        lock = await _lock_manager.get_lock(conversation_id)
+        async with lock:
+            avatar = self.plugin_instance.load_conversation_avatar(conversation_id)
+            if not avatar or outfit_name not in avatar.outfits:
+                logger.debug(f"❌ 衣着方案 [{outfit_name}] 不存在")
+                return f"❌ 衣着方案 [{outfit_name}] 不存在"
+            if avatar.current_outfit == outfit_name:
+                logger.debug(f"❌ 不能删除当前衣着，请先切换")
+                return f"❌ 不能删除当前衣着，请先切换"
+            del avatar.outfits[outfit_name]
+            self.plugin_instance.save_conversation_avatar(avatar)
+            logger.info(f"✅ 衣着 [{outfit_name}] 已删除")
+            return f"✅ 衣着 [{outfit_name}] 已删除"
 
 # ===================== 插件主类 =====================
 class BotAvatarManager(Star):
@@ -219,191 +367,145 @@ class BotAvatarManager(Star):
         self.data_dir = StarTools.get_data_dir()
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
-        self.context.add_llm_tools(
-            CreateAvatarOutfitTool(plugin_instance=self),
-            SelectAvatarOutfitTool(plugin_instance=self),
-            ModifyAvatarFieldTool(plugin_instance=self),
-            DeleteAvatarOutfitTool(plugin_instance=self),
-        )
-        logger.info("=====[BotAvatarManager] initialized =====")
+        # 注册LLM工具（根据配置动态添加）
+        tools = []
+        # 身体相关工具
+        if self.config.get("allow_llm_modify_body", False):
+            tools.extend([CreateBodySchemaTool(plugin_instance=self),
+                          ModifyBodyFieldTool(plugin_instance=self),
+                          DeleteBodySchemaTool(plugin_instance=self)])
+        if self.config.get("allow_llm_switch_body", True):
+            tools.append(SelectBodySchemaTool(plugin_instance=self))
+        # 衣着相关工具
+        if self.config.get("allow_llm_modify_outfit", True):
+            tools.extend([CreateOutfitTool(plugin_instance=self),
+                          ModifyOutfitFieldTool(plugin_instance=self),
+                          DeleteOutfitTool(plugin_instance=self)])
+        if self.config.get("allow_llm_switch_outfit", True):
+            tools.append(SelectOutfitTool(plugin_instance=self))
+
+        self.context.add_llm_tools(*tools)
+        logger.info("BotAvatarManager 初始化完成，工具注册数量: %d", len(tools))
 
     # --------------------- 事件监听：自动插入形象 ---------------------
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: Any):
-        logger.info("监听到LLM请求，准备注入形象数据")
         conversation_id = _get_conversation_id(event)
         lock = await _lock_manager.get_lock(conversation_id)
         async with lock:
-            avatar_data = self.load_conversation_avatar(conversation_id)
+            avatar = self.load_conversation_avatar(conversation_id)
 
-            # 无形象则创建默认两套
-            if not avatar_data or len(avatar_data.outfits) == 0:
-                normal = AvatarOutfit(
-                    description="日常校园通勤穿搭，正式得体",
-                    fields={
-                        "上衣": "白色衬衫+灰色马甲",
-                        "下着": "黑色百褶裙",
-                        "袜子": "白色裤袜",
-                        "鞋子": "棕色小皮鞋",
-                        "内衣": "蓝白条内衣",
-                        "内裤": "蓝白条内裤",
-                    }
-                )
-                home = AvatarOutfit(
-                    description="舒适居家休闲穿搭，柔软亲肤",
-                    fields={
-                        "上衣": "白色纱质连衣裙",
-                        "内衣": "黑色蕾丝内衣",
-                        "内裤": "黑色蕾丝内裤",
-                    }
-                )
-                # 直接保存到outfits
-                if not avatar_data:
-                    avatar_data = ConversationAvatar(conversation_id=conversation_id)
-                avatar_data.outfits["常服"] = normal
-                avatar_data.outfits["居家服"] = home
-                avatar_data.current_outfit = "常服"
-                self.save_conversation_avatar(avatar_data)
-                logger.info(f"会话[{conversation_id}]创建默认形象：常服+居家服")
+            # 无数据则创建默认
+            if not avatar or not avatar.bodies:
+                avatar = self._create_default_avatar(conversation_id)
+                self.save_conversation_avatar(avatar)
 
-            # 若当前形象指针失效，自动修复
-            if avatar_data.current_outfit not in avatar_data.outfits:
-                if avatar_data.outfits:
-                    new_current = next(iter(avatar_data.outfits.keys()))
-                    logger.warning(f"当前形象指针失效，自动切换到 {new_current}")
-                    avatar_data.current_outfit = new_current
-                    self.save_conversation_avatar(avatar_data)
-                else:
-                    logger.warning(f"会话[{conversation_id}]无任何形象，跳过注入")
-                    return
+            # 修复无效指针
+            if avatar.current_body not in avatar.bodies and avatar.bodies:
+                avatar.current_body = next(iter(avatar.bodies.keys()))
+                self.save_conversation_avatar(avatar)
+            if avatar.current_outfit not in avatar.outfits and avatar.outfits:
+                avatar.current_outfit = next(iter(avatar.outfits.keys()))
+                self.save_conversation_avatar(avatar)
 
-            # 构建形象文本
-            current = avatar_data.outfits[avatar_data.current_outfit]
-            avatar_text = f"\n【你当前的形象设定（必须严格遵守）】\n会话ID：{conversation_id}\n当前形象：{avatar_data.current_outfit}\n简介：{current.description}\n形象属性：\n"
-            for f, v in current.fields.items():
-                avatar_text += f"- {f}：{v}\n"
-            avatar_text += "【当前形象设定结束】\n\n【可用形象列表（可根据场景自主切换）】\n"
-            for name, outfit in avatar_data.outfits.items():
-                avatar_text += f"- {name}：{outfit.description}\n"
-            avatar_text += "【可用形象列表结束】\n"
+            # 构建上下文文本
+            context_text = ""
+            # 身体部分
+            body = avatar.bodies[avatar.current_body]
+            body_prefix = self.config.get("body_prefix_prompt", "【你当前的身体形象（必须严格遵守）】")
+            body_suffix = self.config.get("body_suffix_prompt", "【身体形象设定结束】")
+            context_text += f"\n{body_prefix}\n"
+            context_text += f"当前身体方案：{avatar.current_body}\n简介：{body.description}\n"
+            for k, v in body.fields.items():
+                context_text += f"- {k}：{v}\n"
+            context_text += f"{body_suffix}\n"
 
-            # 按配置插入
+            # 可选身体方案列表（简单格式）
+            if len(avatar.bodies) > 1:
+                context_text += "\n【可选身体方案】\n"
+                for name, b in avatar.bodies.items():
+                    if name != avatar.current_body:
+                        context_text += f"- {name}：{b.description}\n"
+                context_text += "【可选身体方案结束】\n"
+
+            # 衣着部分
+            outfit = avatar.outfits[avatar.current_outfit]
+            outfit_prefix = self.config.get("outfit_prefix_prompt", "【你当前的衣着形象（必须严格遵守）】")
+            outfit_suffix = self.config.get("outfit_suffix_prompt", "【衣着形象设定结束】")
+            context_text += f"\n{outfit_prefix}\n"
+            context_text += f"当前衣着：{avatar.current_outfit}\n简介：{outfit.description}\n"
+            for k, v in outfit.fields.items():
+                context_text += f"- {k}：{v}\n"
+            context_text += f"{outfit_suffix}\n"
+
+            # 可用衣着列表（支持前后缀）
+            if len(avatar.outfits) > 1:
+                list_prefix = self.config.get("available_outfit_list_prefix", "\n【可用衣着列表（可自主切换）】")
+                list_suffix = self.config.get("available_outfit_list_suffix", "【可用衣着列表结束】")
+                context_text += f"{list_prefix}\n"
+                for name, o in avatar.outfits.items():
+                    if name != avatar.current_outfit:
+                        context_text += f"- {name}：{o.description}\n"
+                context_text += f"{list_suffix}\n"
+
+            # 插入到指定位置
             insert_pos = self.config.get("llm_insert_position", "system_prompt_end")
             if insert_pos == "system_prompt_start":
-                req.system_prompt = avatar_text + req.system_prompt
+                req.system_prompt = context_text + req.system_prompt
             elif insert_pos == "system_prompt_end":
-                req.system_prompt += avatar_text
+                req.system_prompt += context_text
             elif insert_pos == "user_prompt_start":
-                req.prompt = avatar_text + req.prompt
+                req.prompt = context_text + req.prompt
             elif insert_pos == "user_prompt_end":
-                req.prompt += avatar_text
+                req.prompt += context_text
             else:
-                req.system_prompt += avatar_text  # 默认结尾
+                req.system_prompt += context_text
 
-            logger.info(f"会话[{conversation_id}]形象数据已注入LLM上下文")
+            logger.debug(f"会话 {conversation_id} 形象已注入")
 
-    # --------------------- 管理员指令 ---------------------
-    @filter.command("查看bot形象")
-    async def view_avatar(self, event: AstrMessageEvent):
-        conversation_id = _get_conversation_id(event)
-        lock = await _lock_manager.get_lock(conversation_id)
-        async with lock:
-            avatar_data = self.load_conversation_avatar(conversation_id)
-            if not avatar_data or not avatar_data.outfits:
-                yield event.plain_result("❌ 当前会话无形象数据")
-                return
+    def _create_default_avatar(self, conversation_id: str) -> ConversationAvatar:
+        """创建包含默认身体和两套衣着的形象"""
+        # 默认身体（蓝长发、金瞳、星星发饰）
+        default_body = BodySchema(
+            description="标准体型，蓝色长发，金色瞳孔，佩戴星星发饰",
+            fields={
+                "发色": "蓝色长发",
+                "瞳色": "金色",
+                "发饰": "星星发饰",
+                "身高": "165cm",
+                "胸围": "B cup"
+            }
+        )
+        # 默认衣着：常服
+        normal_outfit = Outfit(
+            description="日常校园通勤穿搭，正式得体",
+            fields={
+                "上衣": "白色衬衫+灰色马甲",
+                "下着": "黑色百褶裙",
+                "袜子": "白色裤袜",
+                "鞋子": "棕色小皮鞋",
+                "内衣": "蓝白条内衣",
+                "内裤": "蓝白条内裤"
+            }
+        )
+        # 居家服
+        home_outfit = Outfit(
+            description="舒适居家休闲穿搭，柔软亲肤",
+            fields={
+                "上衣": "白色纱质连衣裙",
+                "内衣": "黑色蕾丝内衣",
+                "内裤": "黑色蕾丝内裤"
+            }
+        )
+        return ConversationAvatar(
+            conversation_id=conversation_id,
+            current_body="默认身体",
+            bodies={"默认身体": default_body},
+            current_outfit="常服",
+            outfits={"常服": normal_outfit, "居家服": home_outfit}
+        )
 
-            # 确保 current_outfit 有效
-            if avatar_data.current_outfit not in avatar_data.outfits:
-                if avatar_data.outfits:
-                    avatar_data.current_outfit = next(iter(avatar_data.outfits.keys()))
-                    self.save_conversation_avatar(avatar_data)
-                else:
-                    yield event.plain_result("❌ 形象列表为空")
-                    return
-
-            reply = f"📝 会话 Bot 形象信息\n会话ID：{conversation_id}\n\n▶️ 当前形象：{avatar_data.current_outfit}\n"
-            cur = avatar_data.outfits[avatar_data.current_outfit]
-            reply += f"简介：{cur.description}\n形象属性：\n"
-            for k, v in cur.fields.items():
-                reply += f"- {k}：{v}\n"
-            reply += f"\n📋 完整形象列表（共{len(avatar_data.outfits)}套）：\n"
-            for name, outfit in avatar_data.outfits.items():
-                reply += f"\n├─ 【{name}】（简介：{outfit.description}）\n"
-                for k, v in outfit.fields.items():
-                    reply += f"│  └─ {k}：{v}\n"
-            yield event.plain_result(reply)
-
-    @filter.command("创建bot形象")
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    async def create_outfit_admin(self, event: AstrMessageEvent, outfit_name: str, description: str = "无简介", *args):
-        conversation_id = _get_conversation_id(event)
-        # 解析字段 k=v
-        fields = {}
-        for arg in args:
-            if "=" in arg:
-                k, v = arg.split("=", 1)
-                fields[k.strip()] = v.strip()
-
-        lock = await _lock_manager.get_lock(conversation_id)
-        async with lock:
-            # 权限过滤
-            allow_custom = self.config.get("allow_custom_fields", True)
-            config_fields_str = self.config.get("avatar_fields", "")
-            allowed = [f.strip() for f in config_fields_str.split(",") if f.strip()]
-            if not allow_custom and allowed:
-                fields = {k: v for k, v in fields.items() if k in allowed}
-
-            outfit = AvatarOutfit(description=description, fields=fields)
-            self.save_outfit_to_list(conversation_id, outfit_name, outfit)
-            yield event.plain_result(f"✅ 创建形象 [{outfit_name}] 成功\n简介：{description}\n词条：{fields}")
-
-    @filter.command("切换bot形象")
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    async def switch_outfit_admin(self, event: AstrMessageEvent, outfit_name: str):
-        conversation_id = _get_conversation_id(event)
-        lock = await _lock_manager.get_lock(conversation_id)
-        async with lock:
-            avatar_data = self.load_conversation_avatar(conversation_id)
-            if not avatar_data or outfit_name not in avatar_data.outfits:
-                yield event.plain_result(f"❌ 形象 [{outfit_name}] 不存在")
-                return
-            avatar_data.current_outfit = outfit_name
-            self.save_conversation_avatar(avatar_data)
-            yield event.plain_result(f"✅ 已切换当前形象为【{outfit_name}】")
-
-    @filter.command("删除bot形象")
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    async def delete_outfit_admin(self, event: AstrMessageEvent, outfit_name: str):
-        conversation_id = _get_conversation_id(event)
-        lock = await _lock_manager.get_lock(conversation_id)
-        async with lock:
-            avatar_data = self.load_conversation_avatar(conversation_id)
-            if not avatar_data or outfit_name not in avatar_data.outfits:
-                yield event.plain_result(f"❌ 形象 [{outfit_name}] 不存在")
-                return
-            if avatar_data.current_outfit == outfit_name:
-                yield event.plain_result("❌ 无法删除当前使用的形象，请先切换")
-                return
-            del avatar_data.outfits[outfit_name]
-            self.save_conversation_avatar(avatar_data)
-            yield event.plain_result(f"✅ 删除形象 [{outfit_name}] 成功，剩余：{list(avatar_data.outfits.keys())}")
-
-    @filter.command("清空当前对话形象")
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    async def clear_conversation_avatar(self, event: AstrMessageEvent):
-        conversation_id = _get_conversation_id(event)
-        lock = await _lock_manager.get_lock(conversation_id)
-        async with lock:
-            file_path = self.get_conversation_file_path(conversation_id)
-            if os.path.exists(file_path):
-                os.remove(file_path)
-                yield event.plain_result(f"✅ 已清空会话 [{conversation_id}] 的所有形象数据")
-            else:
-                yield event.plain_result("❌ 当前会话无形象数据")
-            await _lock_manager.cleanup(conversation_id)
-
-    # --------------------- 数据读写方法 ---------------------
+    # --------------------- 数据读写（兼容旧版迁移） ---------------------
     def get_conversation_file_path(self, conversation_id: str) -> str:
         return str(self.data_dir / f"{conversation_id}.json")
 
@@ -411,76 +513,173 @@ class BotAvatarManager(Star):
         file_path = self.get_conversation_file_path(conversation_id)
         if not os.path.exists(file_path):
             return None
-
         try:
             with open(file_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
-            # 旧数据迁移（outfits为list时）
-            if isinstance(data.get("outfits"), list):
+            # 旧数据迁移（无bodies字段）
+            if "bodies" not in data:
                 logger.info(f"迁移旧数据：{conversation_id}")
-                new_outfits = {}
-                current = "常服"
-                for o in data.get("outfits", []):
-                    name = o.get("outfit_name", "未知")
-                    desc = o.get("description", "无简介")
-                    fields = o.get("fields", {})
-                    if name == "当前形象":
-                        new_outfits["常服"] = AvatarOutfit(description=desc, fields=fields)
-                        current = "常服"
-                    else:
-                        new_outfits[name] = AvatarOutfit(description=desc, fields=fields)
+                # 旧outfits可能是list或dict
+                if isinstance(data.get("outfits"), list):
+                    outfits_dict = {}
+                    for o in data.get("outfits", []):
+                        name = o.get("outfit_name", "未知")
+                        desc = o.get("description", "无简介")
+                        fields = o.get("fields", {})
+                        outfits_dict[name] = Outfit(description=desc, fields=fields)
+                    current_outfit = data.get("current_outfit", "常服")
+                else:
+                    outfits_dict = {}
+                    for name, od in data.get("outfits", {}).items():
+                        outfits_dict[name] = Outfit(
+                            description=od.get("description", "无简介"),
+                            fields=od.get("fields", {})
+                        )
+                    current_outfit = data.get("current_outfit", "常服")
+                # 创建默认身体
+                default_body = BodySchema(
+                    description="标准体型，蓝色长发，金色瞳孔，佩戴星星发饰",
+                    fields={"发色": "蓝色长发", "瞳色": "金色", "发饰": "星星发饰", "身高": "165cm", "胸围": "B cup"}
+                )
                 new_avatar = ConversationAvatar(
                     conversation_id=conversation_id,
-                    current_outfit=current,
-                    outfits=new_outfits
+                    current_body="默认身体",
+                    bodies={"默认身体": default_body},
+                    current_outfit=current_outfit,
+                    outfits=outfits_dict
                 )
-                # 立即保存迁移后的新结构
                 self.save_conversation_avatar(new_avatar)
                 return new_avatar
 
             # 新结构加载
+            bodies = {}
+            for name, bd in data.get("bodies", {}).items():
+                bodies[name] = BodySchema(
+                    description=bd.get("description", "无简介"),
+                    fields=bd.get("fields", {})
+                )
             outfits = {}
             for name, od in data.get("outfits", {}).items():
-                outfits[name] = AvatarOutfit(
+                outfits[name] = Outfit(
                     description=od.get("description", "无简介"),
                     fields=od.get("fields", {})
                 )
             return ConversationAvatar(
                 conversation_id=data.get("conversation_id", conversation_id),
+                current_body=data.get("current_body", "默认身体"),
+                bodies=bodies,
                 current_outfit=data.get("current_outfit", "常服"),
                 outfits=outfits
             )
         except Exception as e:
-            logger.error(f"加载会话 {conversation_id} 数据失败: {e}")
+            logger.error(f"加载会话 {conversation_id} 失败: {e}")
             try:
-                backup_path = f"{file_path}.bak.{os.urandom(4).hex()}"
-                os.rename(file_path, backup_path)
-                logger.warning(f"损坏文件已备份至 {backup_path}")
-            except Exception as e2:
-                logger.error(f"备份失败: {e2}")
+                backup = f"{file_path}.bak.{os.urandom(4).hex()}"
+                os.rename(file_path, backup)
+                logger.warning(f"损坏文件已备份至 {backup}")
+            except Exception:
+                pass
             return None
 
-    def save_conversation_avatar(self, avatar_data: ConversationAvatar):
-        file_path = self.get_conversation_file_path(avatar_data.conversation_id)
+    def save_conversation_avatar(self, avatar: ConversationAvatar):
+        file_path = self.get_conversation_file_path(avatar.conversation_id)
         try:
             data = {
-                "conversation_id": avatar_data.conversation_id,
-                "current_outfit": avatar_data.current_outfit,
-                "outfits": {name: asdict(outfit) for name, outfit in avatar_data.outfits.items()}
+                "conversation_id": avatar.conversation_id,
+                "current_body": avatar.current_body,
+                "bodies": {name: asdict(b) for name, b in avatar.bodies.items()},
+                "current_outfit": avatar.current_outfit,
+                "outfits": {name: asdict(o) for name, o in avatar.outfits.items()}
             }
             with open(file_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            logger.debug(f"保存会话 {avatar_data.conversation_id} 成功")
         except Exception as e:
             logger.error(f"保存失败: {e}")
 
-    def save_outfit_to_list(self, conversation_id: str, outfit_name: str, outfit: AvatarOutfit):
-        avatar_data = self.load_conversation_avatar(conversation_id)
-        if not avatar_data:
-            avatar_data = ConversationAvatar(conversation_id=conversation_id)
-        avatar_data.outfits[outfit_name] = outfit
-        self.save_conversation_avatar(avatar_data)
+    # --------------------- 管理员指令（部分保留并适配） ---------------------
+    @filter.command("查看bot形象")
+    async def view_avatar(self, event: AstrMessageEvent):
+        conversation_id = _get_conversation_id(event)
+        lock = await _lock_manager.get_lock(conversation_id)
+        async with lock:
+            avatar = self.load_conversation_avatar(conversation_id)
+            if not avatar:
+                yield event.plain_result("❌ 当前会话无形象数据")
+                return
+            # 确保指针有效
+            if avatar.current_body not in avatar.bodies and avatar.bodies:
+                avatar.current_body = next(iter(avatar.bodies.keys()))
+                self.save_conversation_avatar(avatar)
+            if avatar.current_outfit not in avatar.outfits and avatar.outfits:
+                avatar.current_outfit = next(iter(avatar.outfits.keys()))
+                self.save_conversation_avatar(avatar)
+
+            result = f"📝 会话ID：{conversation_id}\n\n"
+            # 身体部分
+            result += "🧬 当前身体方案：\n"
+            body = avatar.bodies[avatar.current_body]
+            result += f"  名称：{avatar.current_body}\n  简介：{body.description}\n  属性：\n"
+            for k, v in body.fields.items():
+                result += f"    - {k}：{v}\n"
+            # 可用身体方案
+            if len(avatar.bodies) > 1:
+                result += "\n📋 其他身体方案：\n"
+                for name, b in avatar.bodies.items():
+                    if name != avatar.current_body:
+                        result += f"  • {name}：{b.description}\n"
+            # 衣着部分
+            result += "\n👗 当前衣着方案：\n"
+            outfit = avatar.outfits[avatar.current_outfit]
+            result += f"  名称：{avatar.current_outfit}\n  简介：{outfit.description}\n  属性：\n"
+            for k, v in outfit.fields.items():
+                result += f"    - {k}：{v}\n"
+            if len(avatar.outfits) > 1:
+                result += "\n📋 其他衣着方案：\n"
+                for name, o in avatar.outfits.items():
+                    if name != avatar.current_outfit:
+                        result += f"  • {name}：{o.description}\n"
+            yield event.plain_result(result)
+
+    @filter.command("切换身体方案")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def switch_body_admin(self, event: AstrMessageEvent, body_name: str):
+        conversation_id = _get_conversation_id(event)
+        lock = await _lock_manager.get_lock(conversation_id)
+        async with lock:
+            avatar = self.load_conversation_avatar(conversation_id)
+            if not avatar or body_name not in avatar.bodies:
+                yield event.plain_result(f"❌ 身体方案 [{body_name}] 不存在")
+                return
+            avatar.current_body = body_name
+            self.save_conversation_avatar(avatar)
+            yield event.plain_result(f"✅ 已切换身体方案为 【{body_name}】")
+
+    @filter.command("切换bot形象")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def switch_outfit_admin(self, event: AstrMessageEvent, outfit_name: str):
+        conversation_id = _get_conversation_id(event)
+        lock = await _lock_manager.get_lock(conversation_id)
+        async with lock:
+            avatar = self.load_conversation_avatar(conversation_id)
+            if not avatar or outfit_name not in avatar.outfits:
+                yield event.plain_result(f"❌ 衣着方案 [{outfit_name}] 不存在")
+                return
+            avatar.current_outfit = outfit_name
+            self.save_conversation_avatar(avatar)
+            yield event.plain_result(f"✅ 已切换衣着为 【{outfit_name}】")
+
+    @filter.command("清空当前对话形象")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def clear_conversation(self, event: AstrMessageEvent):
+        conversation_id = _get_conversation_id(event)
+        file_path = self.get_conversation_file_path(conversation_id)
+        if os.path.exists(file_path):
+            os.remove(file_path)
+            await _lock_manager.cleanup(conversation_id)
+            yield event.plain_result(f"✅ 已清空会话 [{conversation_id}] 的所有形象数据")
+        else:
+            yield event.plain_result("❌ 当前会话无形象数据")
 
     async def terminate(self):
-        logger.info("BotAvatarManager 插件已卸载")
+        logger.info("BotAvatarManager 已卸载")
