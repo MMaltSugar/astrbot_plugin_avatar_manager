@@ -2,9 +2,6 @@ name: astrbot_plugin_avatar_manager
 display_name: Bot的衣柜
 description: |
   提供形象管理功能，让你的bot学会记录装束并自主切换。
-  注意：此插件在工具同步时依赖AstrBot的remove_llm_tool() API，
-  若使用的AstrBot版本不支持该API，禁用工具需要重启插件才能生效。
-  建议使用AstrBot v4.18.0及以上版本以获得最佳体验。
 version: 1.0.0
 author: MMaltSugar
 repo: https://github.com/MMaltSugar/astrbot_plugin_avatar_manager
