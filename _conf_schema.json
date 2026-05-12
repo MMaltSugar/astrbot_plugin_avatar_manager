@@ -35,6 +35,18 @@
     "default": "【衣着形象设定结束】",
     "hint": "可自定义修改"
   },
+  "available_body_list_prefix": {
+    "description": "可选身体方案列表前置提示词",
+    "type": "string",
+    "default": "\n【可选身体方案】",
+    "hint": "可自定义修改"
+  },
+  "available_body_list_suffix": {
+    "description": "可选身体方案列表后置提示词",
+    "type": "string",
+    "default": "【可选身体方案结束】",
+    "hint": "可自定义修改"
+  },
   "available_outfit_list_prefix": {
     "description": "可用衣着列表前置提示词",
     "type": "string",
